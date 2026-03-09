@@ -1,0 +1,6 @@
+- poprawic format dat na stronie glownej
+- wyswietlanie odpowiednie i sortowanie
+- ogarnac ze jak jest wolne to mozna wpisac za kiedy wolne
+- usprawnic logi 
+- posprawdzac tresci na kazdej podstronie i przetestowac dzialanie
+- poprawic wyglad
