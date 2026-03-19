@@ -1,5 +1,4 @@
 // app/api/schedule/current/route.ts
-
 import { NextResponse } from "next/server";
 import { getCurrentScheduleFromFirebase } from "@/lib/firebase-rtdb";
 
@@ -17,6 +16,7 @@ export async function GET() {
             savedAt: current.savedAt,
             source: current.source,
             version: current.version,
+            loadedUntil: current.data?.meta?.loadedUntil ?? null,
           }
         : null,
     });

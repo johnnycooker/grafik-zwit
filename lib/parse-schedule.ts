@@ -14,12 +14,52 @@ export type ScheduleData = {
     sheetName: string;
     loadedAt: string;
     source: string;
+    loadedUntil?: string | null;
   };
 };
+
+type ParseScheduleWorkbookOptions = {
+  maxDate?: string;
+};
+
+type EmployeeColumn = {
+  name: string;
+  columnIndex: number;
+};
+
+const MIN_SCHEDULE_DATE = "2026-01-01";
 
 function normalizeCell(value: unknown): string {
   if (value === null || value === undefined) return "";
   return String(value).trim();
+}
+
+function pad2(value: number | string) {
+  return String(value).padStart(2, "0");
+}
+
+function toIsoDate(year: number, month: number, day: number) {
+  return `${year}-${pad2(month)}-${pad2(day)}`;
+}
+
+function parsePolishLikeDateText(text: string): string {
+  const normalized = text.trim();
+
+  if (!normalized) return "";
+
+  const isoMatch = normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (isoMatch) {
+    const [, year, month, day] = isoMatch;
+    return toIsoDate(Number(year), Number(month), Number(day));
+  }
+
+  const dmyMatch = normalized.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$/);
+  if (dmyMatch) {
+    const [, day, month, year] = dmyMatch;
+    return toIsoDate(Number(year), Number(month), Number(day));
+  }
+
+  return "";
 }
 
 function normalizeDate(value: unknown): string {
@@ -30,37 +70,119 @@ function normalizeDate(value: unknown): string {
   if (typeof value === "number") {
     const parsed = XLSX.SSF.parse_date_code(value);
     if (parsed) {
-      const year = parsed.y;
-      const month = String(parsed.m).padStart(2, "0");
-      const day = String(parsed.d).padStart(2, "0");
-      return `${year}-${month}-${day}`;
+      return toIsoDate(parsed.y, parsed.m, parsed.d);
     }
   }
 
   const text = normalizeCell(value);
   if (!text) return "";
 
-  const direct = new Date(text);
-  if (!Number.isNaN(direct.getTime())) {
-    return direct.toISOString().slice(0, 10);
+  const parsedFromText = parsePolishLikeDateText(text);
+  if (parsedFromText) {
+    return parsedFromText;
   }
 
-  return text;
+  return "";
 }
 
-export function parseScheduleWorkbook(buffer: Buffer): ScheduleData {
+function findDutyColumnIndex(headerRow: unknown[]) {
+  return headerRow.findIndex((cell) => {
+    const value = normalizeCell(cell).toLocaleLowerCase("pl-PL");
+    return value === "i dyżur";
+  });
+}
+
+function getWorksheetName(workbook: XLSX.WorkBook) {
+  const exactPlan = workbook.SheetNames.find(
+    (name) => name.trim().toLocaleLowerCase("pl-PL") === "plan",
+  );
+
+  if (exactPlan) {
+    return exactPlan;
+  }
+
+  return workbook.SheetNames[0];
+}
+
+function detectHeaderAndDataStart(rawRows: unknown[][]) {
+  for (let rowIndex = 1; rowIndex < rawRows.length; rowIndex += 1) {
+    const currentRow = rawRows[rowIndex] ?? [];
+    const previousRow = rawRows[rowIndex - 1] ?? [];
+
+    const dateCandidate = normalizeDate(currentRow[0]);
+    if (!dateCandidate) continue;
+
+    const dutyColumnIndex = findDutyColumnIndex(previousRow);
+    if (dutyColumnIndex <= 3) continue;
+
+    const hasAtLeastOneEmployeeName = previousRow
+      .slice(3, dutyColumnIndex)
+      .some((cell) => normalizeCell(cell) !== "");
+
+    if (!hasAtLeastOneEmployeeName) continue;
+
+    return {
+      headerRowIndex: rowIndex - 1,
+      dataStartRowIndex: rowIndex,
+      dutyColumnIndex,
+    };
+  }
+
+  throw new Error(
+    "Nie udało się znaleźć wiersza nagłówków i początku danych w arkuszu Plan.",
+  );
+}
+
+function extractEmployeeColumns(
+  headerRow: unknown[],
+  startColumnIndex: number,
+  endColumnIndexExclusive: number,
+): EmployeeColumn[] {
+  const employees: EmployeeColumn[] = [];
+
+  for (
+    let columnIndex = startColumnIndex;
+    columnIndex < endColumnIndexExclusive;
+    columnIndex += 1
+  ) {
+    const name = normalizeCell(headerRow[columnIndex]);
+
+    if (!name) continue;
+
+    employees.push({
+      name,
+      columnIndex,
+    });
+  }
+
+  if (!employees.length) {
+    throw new Error("Nie znaleziono żadnych nazwisk w arkuszu Plan.");
+  }
+
+  return employees;
+}
+
+export function parseScheduleWorkbook(
+  buffer: Buffer,
+  options: ParseScheduleWorkbookOptions = {},
+): ScheduleData {
   const workbook = XLSX.read(buffer, {
     type: "buffer",
     cellDates: true,
     raw: true,
   });
 
-  const sheetName = workbook.SheetNames[0];
+  const sheetName = getWorksheetName(workbook);
+
   if (!sheetName) {
     throw new Error("Workbook nie zawiera żadnego arkusza.");
   }
 
   const sheet = workbook.Sheets[sheetName];
+
+  if (!sheet) {
+    throw new Error(`Nie znaleziono arkusza ${sheetName}.`);
+  }
 
   const rawRows = XLSX.utils.sheet_to_json<(string | number | Date | null)[]>(
     sheet,
@@ -76,44 +198,49 @@ export function parseScheduleWorkbook(buffer: Buffer): ScheduleData {
     throw new Error("Arkusz jest pusty.");
   }
 
-  const headerRow = rawRows[0].map(normalizeCell);
-  const firstCell = headerRow[0]?.toLowerCase();
+  const { headerRowIndex, dataStartRowIndex, dutyColumnIndex } =
+    detectHeaderAndDataStart(rawRows);
 
-  const hasDateColumn =
-    firstCell === "data" || firstCell === "date" || firstCell.includes("data");
-
-  const employees = (hasDateColumn ? headerRow.slice(1) : headerRow)
-    .map((v) => v.trim())
-    .filter(Boolean);
+  const headerRow = rawRows[headerRowIndex] ?? [];
+  const employeeColumns = extractEmployeeColumns(headerRow, 3, dutyColumnIndex);
+  const maxDate = options.maxDate?.trim() || "";
 
   const rows: ScheduleRow[] = rawRows
-    .slice(1)
-    .filter((row) => row.some((cell) => normalizeCell(cell) !== ""))
-    .map((row, index) => {
-      const date = hasDateColumn
-        ? normalizeDate(row[0])
-        : `Wiersz ${index + 2}`;
-      const values = hasDateColumn ? row.slice(1) : row;
+    .slice(dataStartRowIndex)
+    .map((row) => {
+      const date = normalizeDate(row[0]);
+
+      if (!date) return null;
+      if (date < MIN_SCHEDULE_DATE) return null;
+      if (maxDate && date > maxDate) return null;
 
       const employeesMap: Record<string, string> = {};
 
-      employees.forEach((employee, employeeIndex) => {
-        employeesMap[employee] = normalizeCell(values[employeeIndex]);
-      });
+      for (const employee of employeeColumns) {
+        employeesMap[employee.name] = normalizeCell(row[employee.columnIndex]);
+      }
 
       return {
         date,
         employees: employeesMap,
       };
-    });
+    })
+    .filter((row): row is ScheduleRow => Boolean(row));
+
+  if (!rows.length) {
+    throw new Error(
+      "Nie znaleziono żadnych wierszy grafiku w wybranym zakresie dat.",
+    );
+  }
 
   return {
-    employees,
+    employees: employeeColumns.map((employee) => employee.name),
     rows,
     meta: {
       sheetName,
       loadedAt: new Date().toISOString(),
       source: "microsoft-graph",
+      loadedUntil: maxDate || null,
     },
   };
 }

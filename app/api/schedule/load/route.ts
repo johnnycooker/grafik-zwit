@@ -1,3 +1,4 @@
+// app/api/schedule/load/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { parseScheduleWorkbook } from "@/lib/parse-schedule";
 import { encodeShareUrlForGraph } from "@/lib/share-url";
@@ -29,6 +30,10 @@ function looksLikeXlsx(buffer: Buffer) {
   );
 }
 
+function isValidIsoDate(value: unknown): value is string {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
 export async function POST(request: NextRequest) {
   const session = await auth();
 
@@ -57,11 +62,22 @@ export async function POST(request: NextRequest) {
 
     const body = await request.json().catch(() => null);
     const accessToken = body?.accessToken;
+    const maxDate = body?.maxDate;
 
     if (!accessToken || typeof accessToken !== "string") {
       return NextResponse.json(
         { ok: false, error: "Brak access tokenu." },
         { status: 401 },
+      );
+    }
+
+    if (!isValidIsoDate(maxDate)) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Musisz podać poprawną datę końcową importu.",
+        },
+        { status: 400 },
       );
     }
 
@@ -128,7 +144,7 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      const data = parseScheduleWorkbook(fileBuffer);
+      const data = parseScheduleWorkbook(fileBuffer, { maxDate });
       const saved = await saveCurrentScheduleToFirebase(data);
 
       await writeAuditLog({
@@ -145,6 +161,7 @@ export async function POST(request: NextRequest) {
         meta: {
           rows: data.rows.length,
           employees: data.employees.length,
+          loadedUntil: maxDate,
         },
       });
 
@@ -154,6 +171,7 @@ export async function POST(request: NextRequest) {
         firebase: {
           savedAt: saved.savedAt,
           source: saved.source,
+          loadedUntil: data.meta.loadedUntil ?? null,
         },
       });
     }
@@ -191,7 +209,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const data = parseScheduleWorkbook(fileBuffer);
+    const data = parseScheduleWorkbook(fileBuffer, { maxDate });
     const saved = await saveCurrentScheduleToFirebase(data);
 
     await writeAuditLog({
@@ -208,6 +226,7 @@ export async function POST(request: NextRequest) {
       meta: {
         rows: data.rows.length,
         employees: data.employees.length,
+        loadedUntil: maxDate,
       },
     });
 
@@ -217,6 +236,7 @@ export async function POST(request: NextRequest) {
       firebase: {
         savedAt: saved.savedAt,
         source: saved.source,
+        loadedUntil: data.meta.loadedUntil ?? null,
       },
     });
   } catch (error) {
